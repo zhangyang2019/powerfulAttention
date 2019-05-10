@@ -6,7 +6,7 @@ import sys
 sys.path.append("models/")
 from mlp import MLP
 
-class Att_layer(nn.Module):   #interaction attention
+class Att_mlp_sigmod(nn.Module):   #interaction attention
     def __init__(self, dims, sum_flag=1, multi_head=3, concat=False, inter=0):
         '''
         :param dims: input dims
@@ -15,7 +15,7 @@ class Att_layer(nn.Module):   #interaction attention
         :param concat: not use
         :param inter: if use iteraction!!
         '''
-        super(Att_layer, self).__init__()
+        super(Att_mlp_sigmod, self).__init__()
         self.mutl_number = multi_head
         self.concat = concat
         self.sum_flag = sum_flag
@@ -61,10 +61,67 @@ class Att_layer(nn.Module):   #interaction attention
         # h_out = h
         return h_out
 
+class Att_mlp_softmax(nn.Module):   #interaction attention
+    def __init__(self, dims, sum_flag=1, multi_head=3, concat=False, inter=0):
+        '''
+        :param dims: input dims
+        :param sum_flag: if use sum after attention
+        :param multi_head: if sigmod attention it not be useful
+        :param concat: not use
+        :param inter: if use iteraction!!
+        '''
+        super(Att_mlp_softmax, self).__init__()
+        self.mutl_number = multi_head
+        self.concat = concat
+        self.sum_flag = sum_flag
+        self.sigmod = True
+        self.interaction = inter
+        if inter == 0:
+            print("not use interaction in attention layer!!!")
+        else:
+            print("use interaction!!")
+            self.P = nn.Parameter(torch.FloatTensor(1,dims))
+            nn.init.xavier_normal_(self.P.data, gain=nn.init.calculate_gain('relu'))
+        self.mlp_layer = MLP(2,dims,64,1)
 
-class Att_layer1(nn.Module):
-    def __init__(self,dims,sum_flag=1,multi_head=3,concat=False):
-        super(Att_layer1,self).__init__()
+    def weight_forwaed(self,h):
+        if self.interaction != 0:  #do interaction
+            inter = torch.mul(h,self.P)
+        else:                     # do interaction
+            inter = h
+        m = self.mlp_layer(inter)
+        #m = torch.sigmoid(m)
+        #print(m.shape)
+        return m
+
+
+    def forward(self, graph_info, h):
+        N = graph_info.shape[0]
+        I = torch.eye(N).cuda()
+        graph_info_1 = torch.spmm(graph_info.transpose(-1, -2), I).transpose(-1, -2)
+
+        zero_vec = -9e15 * torch.ones(graph_info.shape).cuda()
+        h0 = h
+        #zero_vec = torch.zeros(graph_info.shape).cuda()
+        e = self.weight_forwaed(h0)
+        e = e.transpose(-1, -2)
+        e = e.repeat(N, 1)
+        att = torch.where(graph_info_1 > 0, e, zero_vec)
+        att = F.softmax(att, dim=-1)
+        h = torch.spmm(att, h0)
+
+        if self.sum_flag == 1:
+            num = torch.sum(graph_info_1, dim=-1)
+            num = torch.diagflat(num)
+            h = torch.matmul(num, h)
+        h_out = h
+
+        return h_out
+
+
+class Att_dire(nn.Module):
+    def __init__(self,dims,sum_flag=1,multi_head=3,concat=False,inter=0):
+        super(Att_dire,self).__init__()
         self.mutl_number = multi_head
         self.concat = concat
         self.sum_flag = sum_flag
@@ -76,20 +133,21 @@ class Att_layer1(nn.Module):
         I = torch.eye(N).cuda()
         graph_info_1 = torch.spmm(graph_info.transpose(-1, -2), I).transpose(-1, -2)
         zero_vec = -9e15 * torch.ones(graph_info.shape).cuda()
+        #zero_vec = torch.zeros(graph_info.shape).cuda()
         h0 = h
         h_out = []
         for PN in range(self.mutl_number):
             P = self.P[:,PN]
             P = P.unsqueeze(-1)
-            #print(P.shape)
             e = torch.matmul(h0,P)
             e = F.relu(e)
+            #e = torch.sigmoid(e)
             e = e.transpose(-1, -2)
             e = e.repeat(N, 1)
             att = torch.where(graph_info_1 > 0, e, zero_vec)
             att = F.softmax(att,dim=-1)
             h = torch.spmm(att, h0)
-            if self.sum_flag==1:
+            if self.sum_flag == 1:
                 num = torch.sum(graph_info_1, dim=-1)
                 num = torch.diagflat(num)
                 h = torch.matmul(num, h)
@@ -105,7 +163,7 @@ class Att_layer1(nn.Module):
         return h_out
 
 class GraphCNN(nn.Module):
-    def __init__(self, num_layers, num_mlp_layers, input_dim, hidden_dim, output_dim, final_dropout, learn_eps, graph_pooling_type, neighbor_pooling_type, device,attention=False,multi_head=3,sum_flag=1,inter=0):
+    def __init__(self, num_layers, num_mlp_layers, input_dim, hidden_dim, output_dim, final_dropout, learn_eps, graph_pooling_type, neighbor_pooling_type, device,attention=False,multi_head=3,sum_flag=1,inter=0,attention_type='mlp-sigmod'):
         '''
             num_layers: number of layers in the neural networks (INCLUDING the input layer)
             num_mlp_layers: number of layers in mlps (EXCLUDING the input layer)
@@ -120,7 +178,7 @@ class GraphCNN(nn.Module):
         '''
 
         super(GraphCNN, self).__init__()
-
+        
         self.final_dropout = final_dropout
         self.device = device
         self.num_layers = num_layers
@@ -131,6 +189,17 @@ class GraphCNN(nn.Module):
         self.attention = attention
         if attention:
             self.attention_layer = nn.ModuleList()
+            if attention_type == 'mlp-sigmod':
+                print("Atttention type: use sigmod attention!!!")
+                AttModul = Att_mlp_sigmod
+            elif attention_type == 'dire': # contain sum or not use sum_flag to flag
+                AttModul = Att_dire
+                print("Atttention type: use dire attention!!!")
+            elif attention_type == 'mlp-softmax':                     #softmax
+                AttModul = Att_mlp_softmax
+                print("Atttention type: use softmax attention!!!")
+            else:
+                print("Don't have attention Model tyep:",attention_type)
 
         ###List of MLPs
         self.mlps = torch.nn.ModuleList()
@@ -152,11 +221,11 @@ class GraphCNN(nn.Module):
             if layer == 0:
                 self.linears_prediction.append(nn.Linear(input_dim, output_dim))
                 if attention:
-                    self.attention_layer.append(Att_layer(input_dim,multi_head=multi_head,sum_flag=sum_flag,inter=inter))
+                    self.attention_layer.append(AttModul(input_dim,multi_head=multi_head,sum_flag=sum_flag,inter=inter))
             else:
                 self.linears_prediction.append(nn.Linear(hidden_dim, output_dim))
                 if attention:
-                    self.attention_layer.append(Att_layer(hidden_dim,multi_head=multi_head,sum_flag=sum_flag,inter=inter))
+                    self.attention_layer.append(AttModul(hidden_dim,multi_head=multi_head,sum_flag=sum_flag,inter=inter))
 
 
     def __preprocess_neighbors_maxpool(self, batch_graph):
